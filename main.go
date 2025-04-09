@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/schollz/wifiscan"
@@ -23,6 +24,17 @@ func checkIsRoot() bool {
 	return currentUser.Uid == "0" // Root has UID 0
 }
 
+// WiFiNetwork represents a single WiFi network with its properties
+type WiFiNetwork struct {
+	SSID         string
+	BSSID        string
+	Signal       int
+	SignalDBm    int
+	Quality      string
+	QualityLabel string
+	InUse        bool
+}
+
 // scanWithNmcli attempts to scan WiFi networks using the nmcli command
 func scanWithNmcli() error {
 	// Check if nmcli is available
@@ -31,51 +43,185 @@ func scanWithNmcli() error {
 		return fmt.Errorf("nmcli not found: %v", err)
 	}
 
-	cmd := exec.Command("nmcli", "-t", "-f", "SSID,SIGNAL,BARS", "device", "wifi", "list")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("nmcli failed: %v\n%s", err, output)
-	}
+	// Use a channel to receive processed network data
+	networkChan := make(chan WiFiNetwork)
+	errorChan := make(chan error)
 
+	// Process nmcli output in a goroutine
+	go func() {
+		// Try a simpler approach with standard output format
+		cmd := exec.Command("nmcli", "-c", "no", "device", "wifi", "list", "--rescan", "yes")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			errorChan <- fmt.Errorf("nmcli failed: %v\n%s", err, output)
+			return
+		}
+
+		if len(output) == 0 {
+			errorChan <- fmt.Errorf("no output from nmcli command")
+			return
+		}
+
+		// Parse the output line by line
+		lines := strings.Split(string(output), "\n")
+		if len(lines) <= 1 {
+			// Try an alternative method
+			shellCmd := exec.Command("sh", "-c", "sudo nmcli device wifi list")
+			shellOutput, shellErr := shellCmd.CombinedOutput()
+			if shellErr != nil {
+				errorChan <- fmt.Errorf("no networks found or command didn't return proper output")
+				return
+			}
+			lines = strings.Split(string(shellOutput), "\n")
+			if len(lines) <= 1 {
+				errorChan <- fmt.Errorf("no networks found with alternative command")
+				return
+			}
+		}
+
+		// Process each line in parallel with goroutines
+		var wg sync.WaitGroup
+
+		// Process each line (skip header)
+		for i, line := range lines {
+			if i == 0 || line == "" {
+				continue // Skip header and empty lines
+			}
+
+			wg.Add(1)
+			go func(line string) {
+				defer wg.Done()
+
+				// Parse the line
+				network, err := parseNetworkLine(line)
+				if err != nil {
+					// Just skip problematic lines
+					return
+				}
+
+				// Send the network to the main goroutine
+				networkChan <- network
+			}(line)
+		}
+
+		// Wait for all parsing goroutines to finish
+		go func() {
+			wg.Wait()
+			close(networkChan)
+		}()
+	}()
+
+	// Wait a bit to ensure we show the header first
+	time.Sleep(100 * time.Millisecond)
+
+	// Display the header
 	fmt.Println("Available Wi-Fi Networks:")
 	fmt.Println("-------------------------")
-	fmt.Printf("%-30s %-20s %-15s\n", "SSID", "Signal Strength", "Quality")
+	fmt.Printf("%-30s %-20s %-20s %-15s\n", "SSID", "MAC Address", "Signal Strength", "Quality")
 	fmt.Println("-------------------------------------------------------------------------")
 
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
+	// Collect the networks
+	var networks []WiFiNetwork
+
+	// Process results from the channel
+	for {
+		select {
+		case err := <-errorChan:
+			return err
+		case network, ok := <-networkChan:
+			if !ok {
+				// Channel closed, all networks processed
+				// Sort networks by signal strength (strongest first)
+				sort.Slice(networks, func(i, j int) bool {
+					return networks[i].Signal > networks[j].Signal
+				})
+
+				// Print the networks
+				for _, network := range networks {
+					fmt.Printf("%-30s %-20s %-20s %-15s\n",
+						network.SSID,
+						network.BSSID,
+						fmt.Sprintf("%d%% (%d dBm)", network.Signal, network.SignalDBm),
+						fmt.Sprintf("%s (%s)", network.Quality, network.QualityLabel))
+				}
+
+				if len(networks) == 0 {
+					fmt.Println("No WiFi networks found. Make sure your WiFi adapter is enabled.")
+				}
+
+				return nil
+			}
+			networks = append(networks, network)
 		}
-
-		fields := strings.Split(line, ":")
-		if len(fields) < 3 {
-			continue
-		}
-
-		ssid := fields[0]
-		if ssid == "" {
-			ssid = "[Hidden Network]"
-		}
-
-		signalStr := fields[1]
-		signal, err := strconv.Atoi(signalStr)
-		if err != nil {
-			continue
-		}
-
-		quality := fields[2]
-		// Convert signal percentage to dBm (rough approximation)
-		// 0% ~ -100 dBm, 100% ~ -40 dBm
-		dbm := -100 + (signal * 60 / 100)
-
-		fmt.Printf("%-30s %-20s %-15s\n",
-			ssid,
-			fmt.Sprintf("%d%% (%d dBm)", signal, dbm),
-			fmt.Sprintf("%s (%s)", quality, getSignalQualityLabelFromPercent(signal)))
 	}
 
-	return nil
+	// This code is unreachable because the function always returns
+	// from within the select statement above when the channel is closed
+	// or an error occurs
+}
+
+// parseNetworkLine parses a single line from nmcli output into a WiFiNetwork struct
+func parseNetworkLine(line string) (WiFiNetwork, error) {
+	network := WiFiNetwork{}
+
+	// Split the line by whitespace
+	fields := strings.Fields(line)
+	if len(fields) < 7 { // Minimum fields we expect
+		return network, fmt.Errorf("not enough fields in line")
+	}
+
+	// Check if this network is in use (has * at the start)
+	startIdx := 0
+	if fields[0] == "*" {
+		network.InUse = true
+		startIdx = 1
+	}
+
+	// Get the BSSID (MAC address)
+	network.BSSID = fields[startIdx]
+
+	// SSID might contain spaces, so we need to handle that
+	// Format: [IN-USE] BSSID SSID MODE CHAN RATE SIGNAL BARS SECURITY
+
+	// Find the index of "Infra" which marks the end of SSID
+	infraIndex := -1
+	for i, field := range fields[startIdx+1:] {
+		if field == "Infra" {
+			infraIndex = startIdx + 1 + i
+			break
+		}
+	}
+
+	// If we found "Infra", use that as the SSID end, otherwise use the original calculation
+	if infraIndex != -1 {
+		network.SSID = strings.Join(fields[startIdx+1:infraIndex], " ")
+	} else {
+		// Fallback to original calculation
+		ssidEnd := len(fields) - 6 // Last 6 fields are: MODE, CHAN, RATE, SIGNAL, BARS, SECURITY
+		network.SSID = strings.Join(fields[startIdx+1:ssidEnd], " ")
+	}
+
+	// Handle hidden networks
+	if network.SSID == "--" {
+		network.SSID = "[Hidden Network]"
+	}
+
+	// Signal strength is 2nd from the end before BARS and SECURITY
+	signalStr := fields[len(fields)-3]
+	signal, err := strconv.Atoi(signalStr)
+	if err != nil {
+		return network, fmt.Errorf("could not parse signal strength: %v", err)
+	}
+
+	// Set signal and convert to dBm
+	network.Signal = signal
+	network.SignalDBm = -100 + (signal * 60 / 100) // 0% ~ -100 dBm, 100% ~ -40 dBm
+
+	// Get the quality bars
+	network.Quality = fields[len(fields)-2]
+	network.QualityLabel = getSignalQualityLabelFromPercent(signal)
+
+	return network, nil
 }
 
 // getSignalQualityLabelFromPercent returns quality label based on percentage (0-100)
@@ -102,14 +248,14 @@ func scanWiFi() {
 
 	fmt.Println("Scanning for WiFi networks...")
 
-	// First attempt: try wifiscan library
-	networks, err := wifiscan.Scan()
+	// First attempt: try nmcli (more reliable for showing actual SSIDs)
+	err := scanWithNmcli()
 	if err != nil {
-		fmt.Printf("Error with primary scanning method: %v\n", err)
+		fmt.Printf("Error with primary scanning method (nmcli): %v\n", err)
 		fmt.Println("Trying alternative scanning method...")
 
-		// Second attempt: try nmcli
-		err = scanWithNmcli()
+		// Second attempt: try wifiscan library
+		networks, err := wifiscan.Scan()
 		if err != nil {
 			fmt.Printf("Error with alternative scanning method: %v\n", err)
 			fmt.Println("\nPossible causes:")
@@ -122,55 +268,60 @@ func scanWiFi() {
 			fmt.Println("3. Check available WiFi adapters: ip link show")
 			return
 		}
-		return
-	}
 
-	// Sort networks by signal strength (strongest first)
-	sort.Slice(networks, func(i, j int) bool {
-		return networks[i].RSSI > networks[j].RSSI
-	})
+		// Sort networks by signal strength (strongest first)
+		sort.Slice(networks, func(i, j int) bool {
+			return networks[i].RSSI > networks[j].RSSI
+		})
 
-	fmt.Println("Available Wi-Fi Networks:")
-	fmt.Println("-------------------------")
-	fmt.Printf("%-30s %-20s %-15s\n", "SSID/MAC", "Signal Strength", "Quality")
-	fmt.Println("-------------------------------------------------------------------------")
+		fmt.Println("Available Wi-Fi Networks:")
+		fmt.Println("-------------------------")
+		fmt.Printf("%-30s %-20s %-20s %-15s\n", "SSID", "MAC Address", "Signal Strength", "Quality")
+		fmt.Println("-------------------------------------------------------------------------")
 
-	uniqueNetworks := make(map[string]bool)
-	for _, network := range networks {
-		// Skip duplicate entries
-		if uniqueNetworks[network.SSID] {
-			continue
+		uniqueNetworks := make(map[string]bool)
+		for _, network := range networks {
+			// Skip duplicate entries
+			if uniqueNetworks[network.SSID] {
+				continue
+			}
+			uniqueNetworks[network.SSID] = true
+
+			// Determine SSID and MAC address
+			ssid := network.SSID
+			macAddress := ""
+
+			// Check if it looks like a MAC address (contains ":" or has hexadecimal format)
+			if strings.Contains(ssid, ":") || isLikelyMacAddress(ssid) {
+				// This is likely a MAC address for a hidden network
+				macAddress = ssid
+				ssid = "[Hidden Network]"
+			} else {
+				// For networks with proper SSIDs, we don't have MAC address from the wifiscan library
+				// The wifiscan library doesn't provide MAC addresses directly in its API
+				macAddress = "N/A" // Not available in this scan method
+			}
+
+			// Calculate signal quality percentage (RSSI typically ranges from -100 to 0)
+			qualityPercentage := 0
+			if network.RSSI >= -30 {
+				qualityPercentage = 100
+			} else if network.RSSI <= -100 {
+				qualityPercentage = 0
+			} else {
+				qualityPercentage = 100 - (int(float64(network.RSSI+30) / -70.0 * 100.0))
+			}
+
+			fmt.Printf("%-30s %-20s %-20s %-15s\n",
+				ssid,
+				macAddress,
+				fmt.Sprintf("%d dBm", network.RSSI),
+				fmt.Sprintf("%d%% (%s)", qualityPercentage, getSignalQualityLabel(qualityPercentage)))
 		}
-		uniqueNetworks[network.SSID] = true
 
-		// Identify if it's likely a MAC address (no normal SSID)
-		networkID := network.SSID
-
-		// Check if it looks like a MAC address (contains ":" or has hexadecimal format)
-		if strings.Contains(networkID, ":") || isLikelyMacAddress(networkID) {
-			// We identify this as a hidden network but don't need to store it
-			// Just use it for display if needed
-			networkID = fmt.Sprintf("%s (Hidden)", networkID)
+		if len(networks) == 0 {
+			fmt.Println("No WiFi networks found. Make sure your WiFi adapter is enabled.")
 		}
-
-		// Calculate signal quality percentage (RSSI typically ranges from -100 to 0)
-		qualityPercentage := 0
-		if network.RSSI >= -30 {
-			qualityPercentage = 100
-		} else if network.RSSI <= -100 {
-			qualityPercentage = 0
-		} else {
-			qualityPercentage = 100 - (int(float64(network.RSSI+30) / -70.0 * 100.0))
-		}
-
-		fmt.Printf("%-30s %-20s %-15s\n",
-			networkID,
-			fmt.Sprintf("%d dBm", network.RSSI),
-			fmt.Sprintf("%d%% (%s)", qualityPercentage, getSignalQualityLabel(qualityPercentage)))
-	}
-
-	if len(networks) == 0 {
-		fmt.Println("No WiFi networks found. Make sure your WiFi adapter is enabled.")
 	}
 }
 
